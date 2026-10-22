@@ -10,6 +10,11 @@ from sucuri.expressions import ConditionError, UnknownNameError, evaluate_condit
 
 logger = logging.getLogger("sucuri")
 
+# Pre-compiled regex patterns for better performance
+_VAR_PATTERN = re.compile(r'\{([a-zA-Z0-9_\.\s\|]+)\}')
+_HASH_VAR_PATTERN = re.compile(r'#([a-zA-Z0-9_\.\s\|]+)')
+_SIMPLE_VAR_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+_NESTED_VAR_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$')
 
 def _escape_raw_text(content, tag):
     """Stop embedded content from closing its own <style>/<script> block.
@@ -19,6 +24,87 @@ def _escape_raw_text(content, tag):
     CSS and JS string contexts.
     """
     return re.sub(rf'</(?={tag}\b)', r'<\\/', content, flags=re.IGNORECASE)
+
+
+def _compile_accessor(var_name):
+    """Compile a variable path into an accessor function for faster lookup.
+    
+    Returns a function that takes a context dict and returns the value.
+    """
+    parts = var_name.split('.')
+    
+    def accessor(context):
+        val = context.get(parts[0])
+        if val is None:
+            return None
+        for part in parts[1:]:
+            if isinstance(val, dict):
+                val = val.get(part)
+            elif isinstance(val, (list, tuple)):
+                if part.isdigit():
+                    index = int(part)
+                    val = val[index] if index < len(val) else None
+                else:
+                    return None
+            else:
+                return None
+            if val is None:
+                return None
+        return val
+    
+    return accessor
+
+
+class _FilterParser:
+    """Pre-parsed filter chain for fast application."""
+    
+    __slots__ = ('filters', 'is_safe')
+    
+    def __init__(self, filter_str):
+        self.filters = []
+        self.is_safe = False
+        
+        if not filter_str:
+            return
+        
+        for f in filter_str.split('|'):
+            f = f.strip()
+            if f == 'safe':
+                self.is_safe = True
+            elif f == 'upper':
+                self.filters.append(self._apply_upper)
+            elif f == 'lower':
+                self.filters.append(self._apply_lower)
+            elif f == 'title':
+                self.filters.append(self._apply_title)
+            else:
+                # Custom filter - store the name for runtime lookup
+                self.filters.append(('custom', f))
+    
+    @staticmethod
+    def _apply_upper(val):
+        return str(val).upper()
+    
+    @staticmethod
+    def _apply_lower(val):
+        return str(val).lower()
+    
+    @staticmethod
+    def _apply_title(val):
+        return str(val).title()
+    
+    def apply(self, val, filters_dict):
+        for f in self.filters:
+            if isinstance(f, tuple):
+                # Custom filter
+                filter_name = f[1]
+                if filter_name in filters_dict:
+                    val = filters_dict[filter_name](val)
+                # If custom filter not found, skip it (keep original value)
+            else:
+                # Built-in filter (method reference)
+                val = f(val)
+        return val
 
 class SucuriCompiler:
     def __init__(self, context=None, base_dir=".", filters=None, watch_enabled=False):
@@ -113,63 +199,63 @@ class SucuriCompiler:
                 return default
         return val
 
+    def _compile_filters(self, filter_str):
+        """Parse filter string into a compiled filter object for fast application."""
+        if not filter_str or '|' not in filter_str:
+            # No filters or single simple filter
+            return None
+        
+        parser = _FilterParser(filter_str)
+        return parser
+
+    def _apply_filters(self, val, parser, filters_dict):
+        """Apply pre-parsed filters to a value."""
+        if parser is None:
+            return val
+        
+        return parser.apply(val, filters_dict)
+
     def _render_text(self, text):
-        # Replace variables {var | filter} or {var.sub} with values from context
+        """Optimized text rendering with pre-parsed filters."""
+        if not text or '{' not in text:
+            return text
+        
+        # Fast path: check for simple variables without filters
+        if _SIMPLE_VAR_PATTERN.match(text.strip()):
+            val = self._get_var(text.strip())
+            if val is not None:
+                return str(val)
+            return f'{{{text.strip()}}}'
+        
+        # For variables with filters, pre-parse the filter chain
+        
         def repl(match):
             raw = match.group(1)
-            parts = raw.split('|')
+            parts = raw.split('|', 1)  # Split only on first |
             var_name = parts[0].strip()
             
-            val = self._get_var(var_name, f"{{{var_name}}}")
+            val = self._get_var(var_name, f'{{{var_name}}}')
             
-            # evaluate filters
-            is_safe = False
-            for f in parts[1:]:
-                f_name = f.strip()
-                if f_name == 'safe':
-                    is_safe = True
-                elif f_name == 'upper':
-                    val = str(val).upper()
-                elif f_name == 'lower':
-                    val = str(val).lower()
-                elif f_name == 'title':
-                    val = str(val).title()
-                elif f_name in self.filters:
-                    val = self.filters[f_name](val)
+            # Apply filters if present
+            if len(parts) > 1:
+                filter_str = parts[1]
+                # Check if we already have a compiled parser in cache
+                cache_key = f'_filter_{filter_str}'
+                parser = getattr(self, cache_key, None)
+                if parser is None:
+                    parser = self._compile_filters(filter_str)
+                    setattr(self, cache_key, parser)
+                
+                if parser:
+                    val = self._apply_filters(val, parser, self.filters)
             
+            # Check for safe filter (need to re-parse for this)
+            is_safe = 'safe' in parts[1:] if len(parts) > 1 else False
             if not is_safe:
                 return escape(str(val))
             return str(val)
         
-        # Also replace #loop_var and #loop_var.nested
-        def repl_hash(match):
-            raw = match.group(1)
-            parts = raw.split('|')
-            var_name = parts[0].strip()
-            
-            val = self._get_var(var_name, f"#{var_name}")
-            
-            is_safe = False
-            for f in parts[1:]:
-                f_name = f.strip()
-                if f_name == 'safe':
-                    is_safe = True
-                elif f_name == 'upper':
-                    val = str(val).upper()
-                elif f_name == 'lower':
-                    val = str(val).lower()
-                elif f_name == 'title':
-                    val = str(val).title()
-                elif f_name in self.filters:
-                    val = self.filters[f_name](val)
-
-            if not is_safe:
-                return escape(str(val))
-            return str(val)
-
-        text = re.sub(r'\{([a-zA-Z0-9_\.\s\|]+)\}', repl, text)
-        text = re.sub(r'#([a-zA-Z0-9_\.\s\|]+)', repl_hash, text)
-        return text.strip()
+        return _VAR_PATTERN.sub(repl, text).strip()
 
     def _extract_raw_code_lines(self, block):
         """
